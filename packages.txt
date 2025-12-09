@@ -1,0 +1,4 @@
+# Dependências sistema (Linux)
+ghostscript
+tk
+tcl
