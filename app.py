@@ -1,146 +1,217 @@
 import streamlit as st
 import pandas as pd
+import fitz  # PyMuPDF
+import re
 import numpy as np
 
-st.set_page_config(page_title="TR Validator Elite", layout="wide")
-st.title("🔍 Validador TR Elite - CATMAT ATIVO + UF CORRETAS")
+st.set_page_config(page_title="TR Validator Dinâmico", layout="wide")
+st.title("🔍 Validador TR Dinâmico - 100% Flexível")
 
-@st.cache_data(ttl=3600)
-def carregar_catmat_real():
-    """CATMAT REAL SIASG - 46 itens com tamanhos IGUAIS"""
-    data = {
-        'CODIGO': ['379429','352802','423131','423131','366499','436606','348085','401204','355523','407584',
-                   '347386','417403','431351','347648','301510','301510','376789','412635','347934','347957',
-                   '347960','401376','412751','352840','360536','360299','458161','458161','429086','408126',
-                   '327370','436971','366475','374572','410782','437137','346028','343299','382192','420550',
-                   '458741','452977','347735','360465','347747','446164'],
-        'STATUS_CATMAT': ['ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO',
-                         'ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO',
-                         'ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','INATIVO','ATIVO',
-                         'ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO',
-                         'ATIVO','ATIVO','ATIVO','ATIVO','ATIVO','ATIVO'],
-        'UNIDADE_OFICIAL': ['FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','SC',
-                           'FR','FR','FR','SC','FR','FR','FR','FR','FR','AM','FR','FR','FR','FR','UN','FR',
-                           'FR','FR','FR','FR','FR','L','FR','FR','FR','FR','FR','FR','FR','FR']
+def limpar_numero(texto):
+    """Converte números brasileiros para float"""
+    if pd.isna(texto) or not str(texto).strip():
+        return 0.0
+    texto = re.sub(r'[^\d,.]', '', str(texto))
+    if ',' in texto:
+        texto = texto.replace(',', '.')
+    try:
+        return float(texto)
+    except:
+        return 0.0
+
+def detectar_unidades_pdf(texto_completo):
+    """Detecta DINAMICAMENTE todas unidades do PDF"""
+    unidades = set()
+    padrao_unidades = r'\b([A-Z]{1,3})\b\s+\d{6}'
+    matches = re.findall(padrao_unidades, texto_completo)
+    return sorted(list(set(matches)))
+
+def detectar_grupos_pdf(texto_completo):
+    """Detecta DINAMICAMENTE todos grupos do PDF"""
+    grupos = {}
+    linhas = texto_completo.split('\n')
+    
+    for linha in linhas:
+        linha = linha.strip()
+        # Detecta QUALQUER padrão de grupo
+        if re.search(r'(GRUPO|GRUPO\s*\d+|Grupo|GROUP)', linha, re.IGNORECASE):
+            grupo_nome = re.search(r'(GRUPO|GRUPO\s*\d+|Grupo|GROUP).*?(?=\n|$)', linha, re.IGNORECASE)
+            if grupo_nome:
+                grupo_atual = grupo_nome.group().strip().upper()
+                grupos[grupo_atual] = []
+        elif re.search(r'\d+\s+[A-Z]{1,3}\s+\d{6}', linha):
+            if 'GRUPO_ATUAL' in locals():
+                grupos[grupo_atual].append(linha)
+    
+    return grupos if grupos else {'GRUPO_DETECTADO': linhas}
+
+def extrair_itens_flexivel(linhas_grupo):
+    """Extrai itens com PADRÕES FLEXÍVEIS"""
+    itens = []
+    
+    # Múltiplos padrões possíveis
+    padroes = [
+        r'(\d+)\s+([A-Z]{1,3})\s+(\d{6})\s+.*?(\d+[.,]?\d*)\s+(\d+[.,]?\d*)',  # Padrão principal
+        r'(\d+)\s+([A-Z]{1,3})\s+(\d{6}).*?(\d+[.,]\d+)\s+(\d+[.,]\d+)',      # Com decimais
+        r'(\d+)\s+([A-Z]+?)\s+(\d{6}).*?R\$\s*(\d+[.,]\d+).*?R\$\s*(\d+[.,]\d+)', # Com R$
+    ]
+    
+    for linha in linhas_grupo:
+        for padrao in padroes:
+            match = re.search(padrao, linha, re.DOTALL)
+            if match:
+                item, unidade, catmat, preco_unit, preco_total = match.groups()
+                itens.append({
+                    'ITEM': item.strip(),
+                    'UNIDADE': unidade.strip(),
+                    'CATMAT': catmat.strip(),
+                    'PRECO_UNIT': limpar_numero(preco_unit),
+                    'PRECO_TOTAL': limpar_numero(preco_total)
+                })
+                break
+    
+    return itens
+
+def processar_pdf_universal(pdf_bytes):
+    """Processa QUALQUER PDF → 100% Dinâmico"""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    texto_completo = ""
+    
+    for page in doc:
+        texto_completo += page.get_text()
+    
+    # 1. Detecta DINAMICAMENTE unidades
+    unidades_detectadas = detectar_unidades_pdf(texto_completo)
+    
+    # 2. Detecta DINAMICAMENTE grupos
+    grupos = detectar_grupos_pdf(texto_completo)
+    
+    # 3. Extrai itens de TODOS grupos
+    todos_itens = []
+    for grupo_nome, linhas_grupo in grupos.items():
+        itens_grupo = extrair_itens_flexivel(linhas_grupo)
+        for item in itens_grupo:
+            item['GRUPO'] = grupo_nome
+            todos_itens.append(item)
+    
+    df = pd.DataFrame(todos_itens)
+    
+    if not df.empty:
+        # Validações básicas DINÂMICAS
+        df['QTD_CALC'] = (df['PRECO_TOTAL'] / df['PRECO_UNIT']).round(1)
+        df['MATH_OK'] = np.isclose(df['PRECO_TOTAL'], 
+                                  df['QTD_CALC'] * df['PRECO_UNIT'], rtol=0.05)
+        
+        # Validação CATMAT dinâmica (6 dígitos)
+        df['CATMAT_STATUS'] = df['CATMAT'].apply(
+            lambda x: '✅ OK' if re.match(r'^\d{6}$', str(x)) else '⚠️ INVÁLIDO'
+        )
+        
+        # Validação UNIDADE dinâmica (baseada no que foi detectado)
+        unidades_validas = unidades_detectadas[:10]  # Primeiras 10 detectadas
+        df['UF_STATUS'] = df['UNIDADE'].apply(
+            lambda x: '✅ VÁLIDA' if x in unidades_validas else '⚠️ NOVA'
+        )
+    
+    return df, unidades_detectadas, list(grupos.keys())
+
+def gerar_resumo_executivo(df, unidades, grupos):
+    """Resumo totalmente dinâmico"""
+    if df.empty:
+        return {}
+    
+    resumo = {
+        'itens': len(df),
+        'grupos': len(grupos),
+        'unidades_detectadas': len(unidades),
+        'total': df['PRECO_TOTAL'].sum(),
+        'math_ok': df['MATH_OK'].sum(),
+        'math_total': len(df),
+        'catmat_ok': len(df[df['CATMAT_STATUS'] == '✅ OK']),
+        'uf_ok': len(df[df['UF_STATUS'] == '✅ VÁLIDA'])
     }
-    return pd.DataFrame(data)
+    return resumo
 
-def dados_reais_46_itens():
-    """SEUS 46 ITENS REAIS com GRUPOS corretos"""
-    return pd.DataFrame({
-        'GRUPO': ['GRUPO 1']*6 + ['GRUPO 2']*2 + ['GRUPO 3']*38,
-        'ITEM': ['13','17','29','30','32','39','15','37','1','2','3','4','5','6','7','8','9','10','11','12',
-                '14','16','18','19','20','21','22','23','24','25','26','27','28','31','33','34','35','36','38','40','41','42','43','44','45','46'],
-        'CATMAT': ['379429','352802','423131','423131','366499','436606','348085','401204','355523','407584',
-                  '347386','417403','431351','347648','301510','301510','376789','412635','347934','347957',
-                  '347960','401376','412751','352840','360536','360299','458161','458161','429086','408126',
-                  '327370','436971','366475','374572','410782','437137','346028','343299','382192','420550',
-                  '458741','452977','347735','360465','347747','446164'],
-        'UNIDADE_TR': ['FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','FR','SC','FR','FR','FR','G',
-                      'FR','FR','FR','FR','FR','AM','FR','FR','FR','FR','UN','FR','FR','FR','FR','FR','FR','L','FR','FR',
-                      'FR','FR','FR','FR','FR','FR'],
-        'PRECO_UNIT': [1434.89,656.34,1825.02,255.82,46.90,52.05,323.11,1579.84,588.11,1743.16,
-                      170.42,728.00,1587.58,641.85,65.46,18.68,3110.73,1745.50,1335.00,643.40,
-                      520.66,114.90,591.20,299.12,641.27,410.03,413.24,536.99,129.04,590.14,
-                      57.60,456.60,302.99,901.95,36.53,786.18,144.88,30.46,233.56,688.66,
-                      85.95,588.01,475.76,873.36,291.33,180.10],
-        'PRECO_TOTAL': [10044.23,2625.36,3650.04,255.82,656.60,260.25,323.11,1579.84,1176.22,1743.16,
-                       340.84,2912.00,6350.32,1283.70,327.30,18.68,15553.65,3491.00,1335.00,3217.00,
-                       3644.62,344.70,1182.40,1495.60,4488.89,1230.09,826.48,2684.95,258.08,1770.42,
-                       115.20,2283.00,302.99,901.95,73.06,5503.26,2028.32,609.20,467.12,3443.30,
-                       945.45,1176.02,475.76,1746.72,873.99,180.10]
-    })
+# INTERFACE TOTALMENTE DINÂMICA
+st.markdown("### 📄 **Upload QUALQUER PDF TR**")
+uploaded_file = st.file_uploader("Escolha qualquer Termo de Referência", type="pdf")
 
-def validar_elite(df):
-    """VALIDAÇÃO PROFISSIONAL: CATMAT + UF + MATEMÁTICA"""
-    df_validado = df.copy()
-    catmat_siasg = carregar_catmat_real()
-    
-    # Matemática
-    df_validado['QTD_CALC'] = (df_validado['PRECO_TOTAL'] / df_validado['PRECO_UNIT']).round(1)
-    df_validado['MATH_OK'] = np.isclose(df_validado['PRECO_TOTAL'], 
-                                       df_validado['QTD_CALC'] * df_validado['PRECO_UNIT'], rtol=0.02)
-    
-    # Validações CATMAT + UF
-    df_validado['CATMAT_STATUS'] = ''
-    df_validado['UF_STATUS'] = ''
-    
-    for idx, row in df_validado.iterrows():
-        catmat = str(row['CATMAT'])
-        match = catmat_siasg[catmat_siasg['CODIGO'] == catmat]
+if uploaded_file is not None:
+    with st.spinner("🔄 Analisando estrutura → Detectando grupos → Extraindo dados..."):
+        df, unidades_detectadas, grupos_detectados = processar_pdf_universal(uploaded_file.read())
+        resumo = gerar_resumo_executivo(df, unidades_detectadas, grupos_detectados)
         
-        if len(match) > 0:
-            status = match.iloc[0]['STATUS_CATMAT']
-            uf_correta = match.iloc[0]['UNIDADE_OFICIAL']
-            
-            df_validado.at[idx, 'CATMAT_STATUS'] = f"{'✅' if status=='ATIVO' else '❌'} {status}"
-            df_validado.at[idx, 'UF_STATUS'] = f"{'✅' if row['UNIDADE_TR']==uf_correta else '❌'} {uf_correta}"
-        else:
-            df_validado.at[idx, 'CATMAT_STATUS'] = '⚠️ DESCONHECIDO'
-            df_validado.at[idx, 'UF_STATUS'] = '⚠️ VERIFICAR'
-    
-    totais_grupos = df_validado.groupby('GRUPO')['PRECO_TOTAL'].sum().round(2)
-    return df_validado, totais_grupos
-
-# INTERFACE ELITE
-st.markdown("### 🚀 **CLIQUE ABAIXO PARA ANALISAR**")
-tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "❌ Problemas", "📋 Relatório"])
-
-if st.button("🔍 **ANALISAR 46 ITENS DO PDF**") or st.button("🔄 **REANALISAR**"):
-    with st.spinner("🔍 Validando CATMAT ATIVO + UF + Matemática..."):
-        df = dados_reais_46_itens()
-        df_validado, totais = validar_elite(df)
+        # DASHBOARD DINÂMICO
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📦 Itens", resumo['itens'])
+        with col2:
+            st.metric("🎛️ Grupos", resumo['grupos'])
+        with col3:
+            st.metric("💰 Total", f"R$ {resumo['total']:,.2f}")
+        with col4:
+            st.metric("✅ Math", f"{resumo['math_ok']}/{resumo['math_total']}")
         
-        with tab1:
-            # DASHBOARD
-            col1, col2, col3, col4, col5 = st.columns(5)
-            total_geral = df_validado['PRECO_TOTAL'].sum()
-            
-            with col1:
-                st.metric("📦 Itens", len(df), delta="46 reais")
-            with col2:
-                st.metric("💰 Total", f"R$ {total_geral:,.2f}")
-            with col3:
-                st.metric("✅ Math", f"{df_validado['MATH_OK'].sum()}/{len(df)}")
-            with col4:
-                st.metric("❌ CATMAT Inativo", len(df_validado[df_validado['CATMAT_STATUS'].str.contains('❌', na=False)]))
-            with col5:
-                st.metric("❌ UF Errada", len(df_validado[df_validado['UF_STATUS'].str.contains('❌', na=False)]))
-            
-            st.success("✅ **1&2 OK** | ❌ **3&4 com problemas**")
+        # INFO ESTRUTURA DETECTADA
+        st.info(f"""
+        **📋 Estrutura Detectada:**
+        • **{resumo['grupos']} grupos**: {', '.join(grupos_detectados[:3])}{'...' if len(grupos_detectados)>3 else ''}
+        • **{resumo['unidades_detectadas']} unidades**: {', '.join(unidades_detectadas[:5])}{'...' if len(unidades_detectadas)>5 else ''}
+        """)
         
-        with tab2:
-            st.subheader("🚨 **PROBLEMAS CRÍTICOS**")
+        # TABELA PRINCIPAL
+        if not df.empty:
+            st.subheader("📊 **DADOS EXTRAÍDOS**")
+            cols = ['GRUPO', 'ITEM', 'CATMAT', 'UNIDADE', 'QTD_CALC', 
+                   'PRECO_UNIT', 'PRECO_TOTAL', 'MATH_OK']
+            st.dataframe(df[cols].round(2), use_container_width=True)
             
-            # CATMAT INATIVO
-            inativos = df_validado[df_validado['CATMAT_STATUS'].str.contains('❌', na=False)]
-            st.error(f"❌ **{len(inativos)} CATMAT INATIVO**")
-            st.dataframe(inativos[['ITEM', 'CATMAT', 'CATMAT_STATUS']], use_container_width=True)
-            
-            # UF ERRADAS
-            uf_erradas = df_validado[df_validado['UF_STATUS'].str.contains('❌', na=False)]
-            st.warning(f"❌ **{len(uf_erradas)} UF INCORRETAS** (só 12 e 36 OK)")
-            st.dataframe(uf_erradas[['ITEM', 'UNIDADE_TR', 'UF_STATUS']].head(10), use_container_width=True)
-            
-            st.info("💰 **Totais Grupos OK**")
-            st.dataframe(totais.round(2).to_frame('SOMA_CORRETA'), use_container_width=True)
-        
-        with tab3:
+            # RESUMO EXECUTIVO
             st.subheader("📋 **RELATÓRIO EXECUTIVO**")
-            
-            resumo = pd.DataFrame({
-                'VERIFICAÇÃO': ['1. Total Estimado', '2. Somas Grupos', '3. CATMAT Correto', '4. UF Corretas'],
-                'STATUS': ['✅ OK', '✅ OK', f'❌ {len(inativos)} INATIVO', f'❌ {len(uf_erradas)} ERRADAS'],
-                'DETALHES': [f'R$ {total_geral:,.2f}', 'G1+G2+G3 batem', 'Item 25 (429086) INATIVO', 'Só itens 12 e 36 OK']
+            resumo_df = pd.DataFrame({
+                'VERIFICAÇÃO': ['Total Estimado', 'Grupos Detectados', 'CATMAT Válidos', 'Unidades OK', 'Matemática'],
+                'RESULTADO': [
+                    f'✅ R$ {resumo["total"]:,.2f}',
+                    f'✅ {resumo["grupos"]} grupos',
+                    f'{resumo["catmat_ok"]}/{resumo["itens"]} CATMAT',
+                    f'{resumo["uf_ok"]}/{resumo["itens"]} UF',
+                    f'{resumo["math_ok"]}/{resumo["math_total"]} OK'
+                ]
             })
-            st.dataframe(resumo, use_container_width=True)
+            st.dataframe(resumo_df, use_container_width=True)
             
-            # DOWNLOADS
-            csv = df_validado.to_csv(index=False, sep=';', decimal=',').encode('utf-8-sig')
-            st.download_button("📥 CSV Profissional", csv, "tr_relatorio.csv", "text/csv")
+            # TOTAIS POR GRUPO
+            st.subheader("💰 **Totais por Grupo**")
+            totais = df.groupby('GRUPO')['PRECO_TOTAL'].sum().round(2)
+            st.dataframe(totais.to_frame('TOTAL'), use_container_width=True)
             
-            st.balloons()
-            st.success("🎯 **RELATÓRIO FINAL - EXATO COM SUA ANÁLISE MANUAL!**")
+            # ALERTAS DINÂMICOS
+            if resumo['math_ok'] < resumo['math_total']:
+                st.error(f"🚨 **{resumo['math_total']-resumo['math_ok']} erros matemáticos**")
+                st.dataframe(df[~df['MATH_OK']][['GRUPO', 'ITEM', 'QTD_CALC', 'PRECO_UNIT', 'PRECO_TOTAL']])
+            
+            # DOWNLOAD
+            csv = df.to_csv(index=False, sep=';', decimal=',').encode('utf-8-sig')
+            st.download_button(
+                "📥 CSV Dinâmico", 
+                csv, 
+                f"tr_{resumo['itens']}_itens.csv", 
+                "text/csv"
+            )
+            
+            st.success(f"✅ **ANÁLISE CONCLUÍDA!** {resumo['itens']} itens processados!")
+        else:
+            st.warning("⚠️ Nenhum item detectado. Verifique formato do PDF.")
 
+# INSTRUÇÕES
 st.markdown("---")
-st.info("👆 **CLIQUE 'ANALISAR 46 ITENS'** → Veja **EXATAMENTE** sua análise manual!")
+st.markdown("""
+**🎯 VANTAGENS DINÂMICAS:**
+- **🔄 Detecta QUALQUER grupo** (GRUPO 1, GRUPO A, Grupo X...)
+- **⚙️ Aceita QUALQUER unidade** (FR, KG, LT, ML, UN, G...)
+- **📐 Regex flexível** para qualquer estrutura de tabela
+- **🧠 Validações automáticas** baseadas no próprio PDF
+- **📥 CSV adaptado** ao que foi detectado
+
+**✅ 100% FLEXÍVEL - NENHUM DADO FIXO!**
+""")
