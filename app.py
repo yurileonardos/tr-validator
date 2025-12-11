@@ -2,57 +2,60 @@ import streamlit as st
 from PIL import Image
 import io
 import google.generativeai as genai
-import openai
-from openai import RateLimitError, AuthenticationError, APIError
 
-# ------------------------------------
-# CONFIGURAÇÃO DE CHAVES / MODELOS
-# ------------------------------------
+# -------------------------------
+# CONFIG GERAL
+# -------------------------------
 
 st.set_page_config(layout="wide")
-st.title("🔍 TR (imagens) → Tabelas HTML (Gemini OU ChatGPT)")
+st.title("🔍 TR (imagens) → Tabelas HTML (Gemini)")
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 
-if GEMINI_API_KEY:
+if not GEMINI_API_KEY:
+    st.error("GEMINI_API_KEY não encontrada em st.secrets. Configure em Settings → Secrets.")
+else:
     genai.configure(api_key=GEMINI_API_KEY)
 
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
-
-GEMINI_MODEL = "gemini-1.5-pro"   # ajuste se sua conta usar outro nome
-OPENAI_MODEL = "gpt-4o-mini"      # ajuste se preferir outro
+# ATENÇÃO: ajuste o nome do modelo conforme o que aparece para você na doc/console.
+# Exemplos comuns atuais: "gemini-2.5-flash", "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
-# ------------------------------------
-# PROMPT ÚNICO PARA AS DUAS IAs
-# ------------------------------------
+# -------------------------------
+# PROMPT PARA GERAR HTML
+# -------------------------------
 
 def montar_prompt_html():
     return """
-Você receberá uma ou mais imagens de páginas de um Termo de Referência
-com tabelas de itens (grupos, código CATMAT, descrição, unidade de fornecimento,
-quantidades, preço unitário e preço total).
+Você receberá uma ou mais imagens de páginas de um Termo de Referência,
+com tabelas de itens contendo, por exemplo:
+- número do grupo
+- número do item
+- código CATMAT
+- descrição do item
+- unidade de fornecimento
+- quantidades
+- preço unitário
+- preço total
 
 TAREFA:
 - Reconstruir as tabelas em HTML usando <table>, <thead>, <tbody>, <tr>, <th>, <td>.
-- Manter a estrutura original: grupos, número do item, descrição, unidade, código CATMAT,
-  quantidades, preço unitário e preço total.
+- Manter a estrutura que aparece nas imagens: grupos, itens, colunas, linhas.
 - NÃO alterar nem arredondar valores numéricos; copie-os como aparecem.
 - Se houver vários grupos, use um <h3> para cada grupo e uma <table> separada.
-- Não adicionar explicações em texto; responda apenas com HTML válido.
+- Não adicionar nenhum texto explicativo fora do HTML.
+Responda SOMENTE com HTML válido.
 """
 
 
-# ------------------------------------
-# 1) TENTAR GEMINI
-# ------------------------------------
+# -------------------------------
+# FUNÇÃO PARA CHAMAR O GEMINI
+# -------------------------------
 
-def tentar_gemini_html(imagens_pil):
+def gerar_html_com_gemini(imagens_pil):
     """
-    Tenta gerar HTML das tabelas usando Gemini (visão).
-    Retorna (html, erro_texto_ou_None).
+    Envia prompt + imagens para o Gemini e retorna o HTML gerado.
     """
     if not GEMINI_API_KEY:
         return None, "GEMINI_API_KEY não configurada."
@@ -60,9 +63,11 @@ def tentar_gemini_html(imagens_pil):
     prompt = montar_prompt_html()
 
     try:
+        # Versão multimodal com imagens: prompt + lista de imagens PIL
         model = genai.GenerativeModel(GEMINI_MODEL)
         contents = [prompt] + imagens_pil
         resp = model.generate_content(contents)
+
         html = resp.text or ""
         if not html.strip():
             return None, "Gemini retornou resposta vazia."
@@ -71,76 +76,9 @@ def tentar_gemini_html(imagens_pil):
         return None, f"Erro Gemini: {e}"
 
 
-# ------------------------------------
-# 2) TENTAR CHATGPT (OpenAI)
-# ------------------------------------
-
-def tentar_chatgpt_html(imagens_pil):
-    """
-    Tenta gerar HTML das tabelas usando ChatGPT.
-    Versão simples: neste esqueleto, o prompt é apenas textual,
-    supondo que você descreva as imagens, ou que tenha OCR antes.
-    Para uso real com visão, seria preciso enviar as imagens via modelo com imagem.
-    """
-    if not OPENAI_API_KEY:
-        return None, "OPENAI_API_KEY não configurada."
-
-    prompt = montar_prompt_html() + "\n\n(Observação: esta chamada está em modo texto simples neste esqueleto.)"
-
-    try:
-        resp = openai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt + "\n\nDescreva as tabelas das imagens como HTML, assumindo que as imagens contêm as tabelas."
-                }
-            ],
-            temperature=0.0,
-        )
-        html = resp.choices[0].message.content or ""
-        if not html.strip():
-            return None, "ChatGPT retornou resposta vazia."
-        return html, None
-    except (RateLimitError, AuthenticationError, APIError) as e:
-        return None, f"Erro OpenAI: {e}"
-    except Exception as e:
-        return None, f"Erro OpenAI: {e}"
-
-
-# ------------------------------------
-# 3) ORQUESTRADOR HÍBRIDO
-# ------------------------------------
-
-def gerar_html_tabelas_hibrido(imagens_pil):
-    """
-    Fluxo:
-    1) Tenta Gemini.
-    2) Se falhar, tenta ChatGPT.
-    3) Se nenhum funcionar, retorna None e mensagens de erro.
-    """
-    erros = []
-
-    # 1) Gemini
-    html, err = tentar_gemini_html(imagens_pil)
-    if html:
-        return html, "Gemini", erros
-    if err:
-        erros.append(err)
-
-    # 2) ChatGPT
-    html, err = tentar_chatgpt_html(imagens_pil)
-    if html:
-        return html, "ChatGPT", erros
-    if err:
-        erros.append(err)
-
-    return None, None, erros
-
-
-# ------------------------------------
+# -------------------------------
 # INTERFACE STREAMLIT
-# ------------------------------------
+# -------------------------------
 
 st.markdown("### 📄 Envie as páginas do TR como imagens (PNG/JPG)")
 
@@ -156,30 +94,28 @@ if files:
     cols = st.columns(min(3, len(files)))
 
     for i, f in enumerate(files):
+        # Ler o arquivo e converter em PIL
         img = Image.open(io.BytesIO(f.read()))
         imagens_pil.append(img)
+
         with cols[i % len(cols)]:
             st.image(img, caption=f"Página {i+1}", use_column_width=True)
 
-    if st.button("🔄 Gerar HTML das tabelas (Gemini → ChatGPT → Fallback)"):
-        with st.spinner("Tentando Gemini, depois ChatGPT, para gerar HTML das tabelas..."):
-            html, origem, erros = gerar_html_tabelas_hibrido(imagens_pil)
+    if st.button("🔄 Gerar HTML das tabelas (Gemini)"):
+        with st.spinner("Chamando o Gemini para gerar o HTML das tabelas..."):
+            html, erro = gerar_html_com_gemini(imagens_pil)
 
-        if origem and html:
-            st.success(f"Tabelas geradas via {origem}.")
-            st.subheader("📊 Tabelas em HTML")
+        if html:
+            st.success("Tabelas geradas com sucesso via Gemini.")
+
+            st.subheader("📊 Tabelas renderizadas")
             st.markdown(html, unsafe_allow_html=True)
 
-            st.subheader("🔎 Código HTML (para inspeção)")
+            st.subheader("🔎 Código HTML (até 4000 caracteres)")
             st.code(html[:4000] + ("..." if len(html) > 4000 else ""), language="html")
-
-            if erros:
-                st.info("Mensagens de erro da outra IA (que não foi usada):\n" + "\n".join(erros))
         else:
-            st.error("Nenhuma API conseguiu gerar HTML neste momento.")
-            if erros:
-                st.text("Detalhes dos erros:")
-                for e in erros:
-                    st.text(f"- {e}")
+            st.error("Não foi possível gerar o HTML.")
+            if erro:
+                st.text(f"Detalhes: {erro}")
 else:
     st.info("Envie uma ou mais imagens das páginas do TR para começar.")
