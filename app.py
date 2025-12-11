@@ -1,77 +1,155 @@
 import streamlit as st
-import fitz  # PyMuPDF para ler PDF
-import re
-import pandas as pd
+import io
+from PIL import Image
+import google.generativeai as genai
+import PyPDF2
+
+# ------------------------------
+# CONFIGURAÇÃO GERAL
+# ------------------------------
 
 st.set_page_config(layout="wide")
-st.title("🔍 TR Validator - Diagnóstico PDF + Regex")
+st.title("🔍 TR PDF Escaneado → Tabela HTML (Gemini)")
 
-# -------------------------------------------------
-# 1. Fallback interno com regex (genérico)
-# -------------------------------------------------
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-def fallback_regex(texto_pdf: str) -> pd.DataFrame:
+if not GEMINI_API_KEY:
+    st.error("GEMINI_API_KEY não configurada nos Secrets do Streamlit.")
+    st.stop()
+
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Escolha do modelo de visão (ajuste se sua conta suportar outro)
+MODEL_NAME = "gemini-1.5-pro"  # modelo multimodal com visão
+
+
+# ------------------------------
+# FUNÇÕES AUXILIARES
+# ------------------------------
+
+def pdf_para_imagens(pdf_bytes: bytes, max_paginas: int = 2) -> list[Image.Image]:
     """
-    Tenta extrair itens com uma regex genérica.
-    IMPORTANTE: isso é só um ponto de partida.
-    Vamos ajustar depois com base no texto bruto real do seu PDF.
+    Converte as primeiras páginas do PDF em imagens (JPEG/PNG) usando PyPDF2 + Pillow.
+
+    Observação: como o PDF já é escaneado, cada página é uma imagem;
+    aqui extraímos essas páginas para enviar ao Gemini. [web:118][web:115]
     """
-    # Exemplo de padrão: UNID CATMAT QTD... PRECO_UNIT PRECO_TOTAL
-    # Você VAI precisar ajustar depois que virmos o texto bruto.
-    padrao = r"\b([A-Z]{1,4})\s+(\d{5,7})\b"
+    # PyPDF2 não renderiza direto para imagem, mas o PDF escaneado geralmente já contém
+    # as páginas como imagens incorporadas. Para simplificar, vamos extrair cada página
+    # como imagem via renderização do leitor do navegador não é trivial no backend,
+    # então o exemplo aqui supõe que o PDF tenha sido salvo com imagens raster.
+    # Para um cenário mais robusto, você poderia usar pdf2image ou similar.
 
-    matches = re.findall(padrao, texto_pdf)
-    itens = []
-    for i, (unid, cat) in enumerate(matches, start=1):
-        itens.append(
-            {
-                "ITEM": i,
-                "UNIDADE": unid,
-                "CATMAT": cat,
-            }
-        )
-    return pd.DataFrame(itens).drop_duplicates(subset=["UNIDADE", "CATMAT"]).reset_index(drop=True)
+    # Como o ambiente do Streamlit Cloud pode não ter poppler, este exemplo faz:
+    # - Tenta abrir o PDF como se cada página fosse uma imagem única (casos simples).
+    # - Se não funcionar, devolve lista vazia.
+
+    imagens = []
+
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+        num_pages = min(len(reader.pages), max_paginas)
+
+        for i in range(num_pages):
+            page = reader.pages[i]
+
+            # Para simplificar, usamos a "imagem" exportada como raster via layout de página.
+            # PyPDF2 em si não renderiza, então este trecho funciona melhor com PDFs
+            # onde as páginas são basicamente imagens incorporadas.
+            # Se não houver fluxo de imagem, não teremos como extrair aqui.
+            if "/XObject" in page["/Resources"]:
+                xObject = page["/Resources"]["/XObject"].get_object()
+                for obj in xObject:
+                    if xObject[obj]["/Subtype"] == "/Image":
+                        size = (xObject[obj]["/Width"], xObject[obj]["/Height"])
+                        data = xObject[obj]._data
+
+                        if xObject[obj]["/ColorSpace"] == "/DeviceRGB":
+                            mode = "RGB"
+                        else:
+                            mode = "P"
+
+                        img = Image.frombytes(mode, size, data)
+                        imagens.append(img)
+                        break  # pega a primeira imagem principal
+            # Se não achar imagem, simplesmente segue
+
+    except Exception as e:
+        st.warning(f"Não foi possível extrair imagens das páginas do PDF: {e}")
+        return []
+
+    return imagens
 
 
-# -------------------------------------------------
-# 2. Interface Streamlit
-# -------------------------------------------------
+def chamar_gemini_html_tabela(imagens: list[Image.Image]) -> str:
+    """
+    Envia as imagens das páginas do PDF para o Gemini e pede
+    que reconstrua as tabelas em HTML. [web:111][web:114]
+    """
+    if not imagens:
+        return "<p>Não foi possível extrair imagens das páginas do PDF.</p>"
 
-st.markdown("### 📄 Upload do Termo de Referência em PDF")
+    prompt = """
+    Você receberá uma ou mais imagens de páginas de um Termo de Referência
+    escaneado, com tabelas de itens (GRUPOS, código CATMAT, descrição,
+    unidade de fornecimento, quantidades, preço unitário, preço total).
 
-uploaded_file = st.file_uploader("Escolha o PDF do TR", type="pdf")
+    TAREFA:
+    - Reconstruir as tabelas em HTML, usando <table>, <thead>, <tbody>, <tr>, <th>, <td>.
+    - Manter a estrutura original das tabelas: grupos, número do item, descrição,
+      unidade, código CATMAT, quantidades, preço unitário e preço total.
+    - NÃO arredondar ou modificar valores numéricos; copie-os como estão.
+    - Se houver vários grupos, use um <h3> para o título de cada grupo
+      e uma <table> separada para cada um.
+    - Não explique nada em texto corrido; responda apenas com HTML válido.
+    """
+
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        # Conteúdo multimodal: primeiro o prompt de texto, depois as imagens
+        contents = [prompt]
+        for img in imagens:
+            contents.append(img)
+
+        response = model.generate_content(contents)
+        return response.text or "<p>Resposta vazia do modelo.</p>"
+    except Exception as e:
+        return f"<p>Erro ao chamar Gemini: {e}</p>"
+
+
+# ------------------------------
+# INTERFACE STREAMLIT
+# ------------------------------
+
+st.markdown("### 📄 Upload do Termo de Referência (PDF escaneado)")
+
+uploaded_file = st.file_uploader("Escolha o PDF do TR (escaneado)", type="pdf")
 
 if uploaded_file is not None:
-    # Ler PDF em memória com PyMuPDF
-    raw_bytes = uploaded_file.read()
-    try:
-        doc = fitz.open(stream=raw_bytes, filetype="pdf")
-    except Exception as e:
-        st.error(f"Erro ao abrir PDF: {e}")
-        st.stop()
+    pdf_bytes = uploaded_file.read()
+    st.success("✅ PDF carregado.")
 
-    texto_pdf = ""
-    for page in doc:
-        texto_pdf += page.get_text()
+    st.markdown("### 🖼️ Pré-visualização das páginas como imagem (se possível)")
 
-    st.success("✅ PDF lido com sucesso. Texto extraído.")
+    # Extrai imagens das primeiras páginas
+    imagens = pdf_para_imagens(pdf_bytes, max_paginas=2)
 
-    # 1) Preview do texto bruto para diagnóstico
-    st.subheader("🔎 Texto bruto do PDF (diagnóstico)")
-    st.info("Copie um trecho deste texto e envie aqui na conversa para ajustar a regex especificamente ao seu modelo de TR.")
-    st.text_area("Texto bruto (primeiros ~3000 caracteres)", texto_pdf[:3000], height=300)
+    if not imagens:
+        st.warning("Não foi possível extrair imagens diretamente do PDF. Para PDFs escaneados, pode ser necessário outro método (ex: pdf2image).")
+    else:
+        cols = st.columns(len(imagens))
+        for col, img in zip(cols, imagens):
+            with col:
+                st.image(img, caption="Página")
 
-    # 2) Fallback com regex genérica
-    if st.button("Tentar extrair itens com regex genérica"):
-        df = fallback_regex(texto_pdf)
+    if st.button("🔄 Enviar ao Gemini para gerar HTML das tabelas"):
+        with st.spinner("Chamando Gemini (visão) para reconstruir as tabelas em HTML..."):
+            html_tabelas = chamar_gemini_html_tabela(imagens)
 
-        if df.empty:
-            st.warning("⚠️ Fallback (regex genérica) não encontrou itens. Precisamos ver o texto bruto para ajustar a regex.")
-        else:
-            st.subheader("📊 Itens detectados (versão genérica)")
-            st.dataframe(df, use_container_width=True)
+        st.subheader("📊 Tabelas em HTML (geradas pelo Gemini)")
+        st.markdown(html_tabelas, unsafe_allow_html=True)
 
-            csv = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
-            st.download_button("📥 Baixar CSV de itens (genérico)", csv, "itens_regex_generica.csv", "text/csv")
+        st.subheader("🔎 Código HTML (para inspeção)")
+        st.code(html_tabelas[:4000] + ("..." if len(html_tabelas) > 4000 else ""), language="html")
 else:
-    st.info("Envie um arquivo PDF para começar.")
+    st.info("Envie um PDF escaneado de TR para começar.")
