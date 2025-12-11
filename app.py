@@ -1,83 +1,99 @@
 import streamlit as st
-import fitz  # PyMuPDF para ler PDF
+import fitz
 import openai
+import google.generativeai as genai
+import re
+import pandas as pd
+from openai import RateLimitError
 
-# 1) pegar chave dos secrets do Streamlit Cloud (Settings → Secrets)
-# Em Secrets, você deve ter: OPENAI_API_KEY = "sk-sua-chave-aqui"
 openai.api_key = st.secrets.get("OPENAI_API_KEY", "")
+gemini_key = st.secrets.get("GEMINI_API_KEY", "")
+if gemini_key:
+    genai.configure(api_key=gemini_key)
 
-st.set_page_config(layout="wide")
-st.title("🔍 Conversor de TR (PDF → HTML com ChatGPT)")
+def prompt_tabelas(texto_pdf: str) -> str:
+    return f"""
+    Você receberá o texto bruto de um Termo de Referência com tabelas de itens.
 
-# ------------------------------
-# Função: PDF (texto) → HTML tabela
-# ------------------------------
+    Monte tabelas em HTML (<table>, <thead>, <tbody>, <tr>, <th>, <td>), 
+    preservando grupos, número do item, descrição, unidade, código CATMAT, 
+    quantidades, preço unitário e preço total.
 
-def pdf_texto_para_html_tabela(texto_pdf: str) -> str:
-    """
-    Envia o texto do PDF para o ChatGPT e recebe um HTML com tabelas
-    preservando ao máximo a organização original.
-    """
-    if not openai.api_key:
-        return "<p>OPENAI_API_KEY não configurada nos Secrets do Streamlit.</p>"
+    Não altere valores numéricos. Responda apenas com HTML válido.
 
-    prompt = f"""
-    Você receberá o texto bruto de um Termo de Referência em português,
-    contendo uma ou mais tabelas de itens (grupos, código CATMAT, descrição, unidade, quantidades, preços).
-
-    TAREFA:
-    - Reconstruir as tabelas em HTML usando <table>, <thead>, <tbody>, <tr>, <th>, <td>.
-    - Manter a estrutura original: grupos, número do item, descrição, unidade, código CATMAT, quantidades, preço unitário, preço total.
-    - Não alterar nem arredondar números; copie os valores exatamente como aparecem no texto.
-    - Não adicionar comentários; responda somente com HTML válido.
-    - Se houver vários grupos, use uma <table> para cada grupo, com um título (por exemplo, <h3>GRUPO X</h3>).
-
-    Texto do PDF (pode estar truncado):
+    Texto (pode estar truncado):
     {texto_pdf[:8000]}
     """
 
-    resp = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.0,
-    )
-
-    html = resp.choices[0].message.content
-    return html
-
-# ------------------------------
-# Interface: upload + conversão
-# ------------------------------
-
-st.markdown("### 📄 Upload do Termo de Referência em PDF")
-
-uploaded_file = st.file_uploader("Escolha o PDF do TR", type="pdf")
-
-if uploaded_file is not None:
-    # Ler PDF em memória com PyMuPDF
-    raw_bytes = uploaded_file.read()
+def tentar_chatgpt(texto_pdf: str) -> str | None:
+    if not openai.api_key:
+        return None
     try:
-        doc = fitz.open(stream=raw_bytes, filetype="pdf")
-    except Exception as e:
-        st.error(f"Erro ao abrir PDF: {e}")
-        st.stop()
+        resp = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt_tabelas(texto_pdf)}],
+            temperature=0.0,
+        )
+        return resp.choices[0].message.content
+    except RateLimitError:
+        return None
+    except Exception:
+        return None
 
-    texto_pdf = ""
-    for page in doc:
-        texto_pdf += page.get_text()
+def tentar_gemini(texto_pdf: str) -> str | None:
+    if not gemini_key:
+        return None
+    try:
+        model = genai.GenerativeModel("gemini-1.5-pro")
+        resp = model.generate_content(prompt_tabelas(texto_pdf))
+        return resp.text  # HTML retornado
+    except Exception:
+        return None
 
-    st.success("✅ PDF lido com sucesso. Texto extraído.")
+def fallback_regex(texto_pdf: str) -> pd.DataFrame:
+    padrao = r"\b([A-Z]{1,4})\s+(\d{5,7})\s+([\d.,]+)\s+([\d.,]+)"
+    matches = re.findall(padrao, texto_pdf)
+    itens = []
+    for i, (unid, catmat, unit, total) in enumerate(matches, start=1):
+        itens.append({
+            "ITEM": i,
+            "UNIDADE": unid,
+            "CATMAT": catmat,
+            "PRECO_UNIT": unit,
+            "PRECO_TOTAL": total,
+        })
+    return pd.DataFrame(itens)
 
-    if st.button("Converter PDF em HTML (ChatGPT)"):
-        with st.spinner("Chamando ChatGPT para montar as tabelas em HTML..."):
-            html_tabelas = pdf_texto_para_html_tabela(texto_pdf)
+st.title("TR Validator Híbrido")
 
-        st.subheader("📊 Tabelas em HTML (geradas pelo ChatGPT)")
-        st.markdown(html_tabelas, unsafe_allow_html=True)
+uploaded_file = st.file_uploader("PDF do TR", type="pdf")
+if uploaded_file:
+    raw = uploaded_file.read()
+    doc = fitz.open(stream=raw, filetype="pdf")
+    texto = "".join(page.get_text() for page in doc)
 
-        st.subheader("🔎 Código HTML (para inspeção/depuração)")
-        st.code(html_tabelas[:3000] + ("..." if len(html_tabelas) > 3000 else ""), language="html")
-else:
-    st.info("Envie um arquivo PDF para começar.")
+    html = None
+    origem = None
+
+    # 1) tenta ChatGPT
+    html = tentar_chatgpt(texto)
+    if html:
+        origem = "ChatGPT"
+
+    # 2) se não deu, tenta Gemini
+    if html is None:
+        html = tentar_gemini(texto)
+        if html:
+            origem = "Gemini"
+
+    if html:
+        st.success(f"Tabelas geradas via {origem}.")
+        st.markdown(html, unsafe_allow_html=True)
+    else:
+        st.warning("Nenhuma API de IA pôde gerar HTML agora. Usando fallback interno (regex).")
+        df = fallback_regex(texto)
+        if df.empty:
+            st.error("Fallback também não encontrou itens. Arquivo pode ter estrutura muito diferente.")
+        else:
+            st.dataframe(df)
+            # aqui você pluga suas validações de quantidade, preço e CATMAT
