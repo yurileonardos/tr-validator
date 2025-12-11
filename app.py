@@ -1,99 +1,77 @@
 import streamlit as st
-import fitz
-import openai
-import google.generativeai as genai
+import fitz  # PyMuPDF para ler PDF
 import re
 import pandas as pd
-from openai import RateLimitError
 
-openai.api_key = st.secrets.get("OPENAI_API_KEY", "")
-gemini_key = st.secrets.get("GEMINI_API_KEY", "")
-if gemini_key:
-    genai.configure(api_key=gemini_key)
+st.set_page_config(layout="wide")
+st.title("🔍 TR Validator - Diagnóstico PDF + Regex")
 
-def prompt_tabelas(texto_pdf: str) -> str:
-    return f"""
-    Você receberá o texto bruto de um Termo de Referência com tabelas de itens.
-
-    Monte tabelas em HTML (<table>, <thead>, <tbody>, <tr>, <th>, <td>), 
-    preservando grupos, número do item, descrição, unidade, código CATMAT, 
-    quantidades, preço unitário e preço total.
-
-    Não altere valores numéricos. Responda apenas com HTML válido.
-
-    Texto (pode estar truncado):
-    {texto_pdf[:8000]}
-    """
-
-def tentar_chatgpt(texto_pdf: str) -> str | None:
-    if not openai.api_key:
-        return None
-    try:
-        resp = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt_tabelas(texto_pdf)}],
-            temperature=0.0,
-        )
-        return resp.choices[0].message.content
-    except RateLimitError:
-        return None
-    except Exception:
-        return None
-
-def tentar_gemini(texto_pdf: str) -> str | None:
-    if not gemini_key:
-        return None
-    try:
-        model = genai.GenerativeModel("gemini-1.5-pro")
-        resp = model.generate_content(prompt_tabelas(texto_pdf))
-        return resp.text  # HTML retornado
-    except Exception:
-        return None
+# -------------------------------------------------
+# 1. Fallback interno com regex (genérico)
+# -------------------------------------------------
 
 def fallback_regex(texto_pdf: str) -> pd.DataFrame:
-    padrao = r"\b([A-Z]{1,4})\s+(\d{5,7})\s+([\d.,]+)\s+([\d.,]+)"
+    """
+    Tenta extrair itens com uma regex genérica.
+    IMPORTANTE: isso é só um ponto de partida.
+    Vamos ajustar depois com base no texto bruto real do seu PDF.
+    """
+    # Exemplo de padrão: UNID CATMAT QTD... PRECO_UNIT PRECO_TOTAL
+    # Você VAI precisar ajustar depois que virmos o texto bruto.
+    padrao = r"\b([A-Z]{1,4})\s+(\d{5,7})\b"
+
     matches = re.findall(padrao, texto_pdf)
     itens = []
-    for i, (unid, catmat, unit, total) in enumerate(matches, start=1):
-        itens.append({
-            "ITEM": i,
-            "UNIDADE": unid,
-            "CATMAT": catmat,
-            "PRECO_UNIT": unit,
-            "PRECO_TOTAL": total,
-        })
-    return pd.DataFrame(itens)
+    for i, (unid, cat) in enumerate(matches, start=1):
+        itens.append(
+            {
+                "ITEM": i,
+                "UNIDADE": unid,
+                "CATMAT": cat,
+            }
+        )
+    return pd.DataFrame(itens).drop_duplicates(subset=["UNIDADE", "CATMAT"]).reset_index(drop=True)
 
-st.title("TR Validator Híbrido")
 
-uploaded_file = st.file_uploader("PDF do TR", type="pdf")
-if uploaded_file:
-    raw = uploaded_file.read()
-    doc = fitz.open(stream=raw, filetype="pdf")
-    texto = "".join(page.get_text() for page in doc)
+# -------------------------------------------------
+# 2. Interface Streamlit
+# -------------------------------------------------
 
-    html = None
-    origem = None
+st.markdown("### 📄 Upload do Termo de Referência em PDF")
 
-    # 1) tenta ChatGPT
-    html = tentar_chatgpt(texto)
-    if html:
-        origem = "ChatGPT"
+uploaded_file = st.file_uploader("Escolha o PDF do TR", type="pdf")
 
-    # 2) se não deu, tenta Gemini
-    if html is None:
-        html = tentar_gemini(texto)
-        if html:
-            origem = "Gemini"
+if uploaded_file is not None:
+    # Ler PDF em memória com PyMuPDF
+    raw_bytes = uploaded_file.read()
+    try:
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+    except Exception as e:
+        st.error(f"Erro ao abrir PDF: {e}")
+        st.stop()
 
-    if html:
-        st.success(f"Tabelas geradas via {origem}.")
-        st.markdown(html, unsafe_allow_html=True)
-    else:
-        st.warning("Nenhuma API de IA pôde gerar HTML agora. Usando fallback interno (regex).")
-        df = fallback_regex(texto)
+    texto_pdf = ""
+    for page in doc:
+        texto_pdf += page.get_text()
+
+    st.success("✅ PDF lido com sucesso. Texto extraído.")
+
+    # 1) Preview do texto bruto para diagnóstico
+    st.subheader("🔎 Texto bruto do PDF (diagnóstico)")
+    st.info("Copie um trecho deste texto e envie aqui na conversa para ajustar a regex especificamente ao seu modelo de TR.")
+    st.text_area("Texto bruto (primeiros ~3000 caracteres)", texto_pdf[:3000], height=300)
+
+    # 2) Fallback com regex genérica
+    if st.button("Tentar extrair itens com regex genérica"):
+        df = fallback_regex(texto_pdf)
+
         if df.empty:
-            st.error("Fallback também não encontrou itens. Arquivo pode ter estrutura muito diferente.")
+            st.warning("⚠️ Fallback (regex genérica) não encontrou itens. Precisamos ver o texto bruto para ajustar a regex.")
         else:
-            st.dataframe(df)
-            # aqui você pluga suas validações de quantidade, preço e CATMAT
+            st.subheader("📊 Itens detectados (versão genérica)")
+            st.dataframe(df, use_container_width=True)
+
+            csv = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+            st.download_button("📥 Baixar CSV de itens (genérico)", csv, "itens_regex_generica.csv", "text/csv")
+else:
+    st.info("Envie um arquivo PDF para começar.")
