@@ -1,5 +1,6 @@
 streamlit
 pandas
-requests
-openpyxl
 PyMuPDF
+openpyxl
+requests
+openai
